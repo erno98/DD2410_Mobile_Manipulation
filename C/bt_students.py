@@ -13,6 +13,17 @@ from geometry_msgs.msg import PoseStamped
 cube_pose = None
 repeat_detection = True
 wait_for_completion = False
+cube_picked_up = False
+cube_placed = False
+reset = True
+reset_completed = [False for _ in range(8)]
+
+def reset():
+	global reset
+	global reset_completed
+
+	reset = True
+	reset_completed = [False for _ in range(6)]
 
 class BehaviourTree(ptr.trees.BehaviourTree):
 
@@ -37,20 +48,20 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		# turn around
 		b5 = pt.composites.Selector(
 			name="Turn 180 degrees",
-			children=[counter(30, "Turned around?"), go("Turn around!", 0, -1)]
+			children=[counter(28, "Turned around?"), go("Turn around!", 0, -1)]
 		)
 
 		# move forward
 		b6 = pt.composites.Selector(
 			name="Go to table",
-			children=[counter(11, "At other table?"), go("Go to the other table!", 1, 0)]
+			children=[counter(8, "At other table?"), go("Go to the other table!", 1, 0)]
 		)
 
 		# place the cube
 		b7 = place_cube("cube placement")
 
-		# check if the cube is placed
-		b8 = check_task_complete("check task completed", aruco_pose_topic)
+		# detect the cube
+		b8 = check_cube_placed("check cube placement", aruco_pose_topic)
 
 		# become the tree
 		tree = RSequence(name="Main sequence", children=[b1, b2, b3, b4, b5, b6, b7, b8])
@@ -59,44 +70,6 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		# execute the behaviour treensm___(name)
 		while not rospy.is_shutdown(): self.tick_tock(1)
 
-
-class check_task_complete(pt.behaviour.Behaviour):
-
-	"""
-	*explaination about this class*
-
-	check if the cube is placed on the second table:
-		- if it is placed: return SUCCESS
-		- else: return FAILURE and set repeat_detection = True
-	"""
-
-	def __init__(self, name, aruco_pose_topic):
-		self.aruco_pose_top = aruco_pose_topic
-		self.found = False
-
-		super(check_task_complete, self).__init__()
-
-	def update(self):
-		global cube_pose
-		global repeat_detection
-
-		if self.found:
-			return pt.common.Status.SUCCESS
-
-		cube_pose = None
-		try:
-			cube_pose = rospy.wait_for_message(self.aruco_pose_top, PoseStamped, 5)
-		except:
-			cube_pose = None
-
-		if cube_pose is None:
-			repeat_detection = True
-		else:
-			repeat_detection = False
-			self.found = True
-			return pt.common.Status.SUCCESS
-
-		return pt.common.Status.FAILURE
 
 
 class pickup_cube(pt.behaviour.Behaviour):
@@ -113,17 +86,24 @@ class pickup_cube(pt.behaviour.Behaviour):
 		super(pickup_cube, self).__init__("Picking up the cube.")
 
 	def update(self):
-		global repeat_detection
+		global reset
+		global reset_completed
+		global cube_picked_up
 
-		if not repeat_detection:
+		if reset and not reset_completed[3]:
+			cube_picked_up = False
+			reset_completed[3] = True
+
+		if cube_picked_up:
 			return pt.common.Status.SUCCESS
 
 		cube_pick_srv = rospy.ServiceProxy(self.pick_srv, SetBool)
 		cube_pick_req = cube_pick_srv(True)
+		cube_picked_up = True
 
 		if cube_pick_req.success:
-			rospy.loginfo("Picking up the cube succeedd!")
-			return pt.common.Status.SUCCESS
+			rospy.loginfo("Picking up the cube succeeded!")
+			return pt.common.Status.RUNNING
 		else:
 			rospy.loginfo("Picking up the cube failed!")
 			return pt.common.Status.FAILURE
@@ -132,23 +112,33 @@ class pickup_cube(pt.behaviour.Behaviour):
 class place_cube(pt.behaviour.Behaviour):
 
 	"""
-	pick up the cube from the table
+	place the cube on the table
 	"""
 
 	def __init__(self, name):
 		self.place_srv = rospy.get_param(rospy.get_name() + "/place_srv")
 		rospy.wait_for_service(self.place_srv, timeout=30)
+		
 
 		super(place_cube, self).__init__("Placing up the cube.")
 
 	def update(self):
-		global repeat_detection
+		global reset
+		global reset_completed
+		global cube_placed
 
-		if not repeat_detection:
+		rospy.sleep(3)
+
+		if reset and not reset_completed[4]:
+			cube_placed = False
+			reset_completed[4] = True
+
+		if cube_placed:
 			return pt.common.Status.SUCCESS
 
 		place_srv_ = rospy.ServiceProxy(self.place_srv, SetBool)
 		place_req = place_srv_()
+		cube_placed = True
 
 		if place_req.success:
 			rospy.loginfo("Placing the cube succeedd!")
@@ -157,6 +147,76 @@ class place_cube(pt.behaviour.Behaviour):
 			rospy.loginfo("Placing the cube failed!")
 			return pt.common.Status.FAILURE
 
+
+class check_cube_placed(pt.behaviour.Behaviour):
+	
+	"""
+	*explaination about this class* 
+	"""
+
+	def __init__(self, name, aruco_pose_topic):
+		self.aruco_pose_top = aruco_pose_topic
+		self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
+		self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+		self.detected = False
+
+		super(check_cube_placed, self).__init__("Detecting the cube.")
+
+	def update(self):
+		global cube_pose
+		global cube_picked_up
+		global repeat_detection
+		global reset
+		global reset_completed
+
+		if reset and not reset_completed[5]:
+			self.detected = False
+			reset_completed[5] = True
+
+		if self.detected:
+			reset = False
+			return pt.common.Status.SUCCESS
+
+		try:
+			cube_pose = rospy.wait_for_message(self.aruco_pose_top, PoseStamped, 5)
+		except:
+			cube_pose = None
+
+		if cube_pose is None:
+			rospy.loginfo("Cube not found. Going to table 1.")
+
+			rospy.loginfo("Moving towards another desk")
+
+			move_msg = Twist()
+			move_msg.angular.z = -1
+
+			rate = rospy.Rate(10)
+			cnt = 0
+			while not rospy.is_shutdown() and cnt < 28:
+				self.cmd_vel_pub.publish(move_msg)
+				rate.sleep()
+				cnt = cnt + 1
+
+			rospy.sleep(1)
+
+			move_msg.linear.x = 1
+			move_msg.angular.z = 0
+			cnt = 0
+			while not rospy.is_shutdown() and cnt < 10:
+				self.cmd_vel_pub.publish(move_msg)
+				rate.sleep()
+				cnt = cnt + 1
+
+			self.cmd_vel_pub.publish(Twist())
+			self.state = 3
+			rospy.sleep(1)
+			reset = True
+			reset_completed = [False for _ in range(6)]
+			return pt.common.Status.SUCCESS
+		else:
+			rospy.loginfo("Cube detected!")
+			self.detected = True
+			return pt.common.Status.SUCCESS
 
 class detect_cube(pt.behaviour.Behaviour):
 	
@@ -172,8 +232,18 @@ class detect_cube(pt.behaviour.Behaviour):
 
 	def update(self):
 		global cube_pose
+		global cube_picked_up
 		global repeat_detection
-		if not repeat_detection or self.detected:
+		global reset
+		global reset_completed
+
+		if reset and not reset_completed[2]:
+			self.detected = False
+			cube_pose = None
+
+			reset_completed[2] = True
+
+		if self.detected:
 			return pt.common.Status.SUCCESS
 		else:
 			cube_pose = None
@@ -194,179 +264,191 @@ class detect_cube(pt.behaviour.Behaviour):
 
 class counter(pt.behaviour.Behaviour):
 
-    """
-    Returns running for n ticks and success thereafter.
-    """
+	"""
+	Returns running for n ticks and success thereafter.
+	"""
 
-    def __init__(self, n, name):
+	def __init__(self, n, name):
 
-        rospy.loginfo("Initialising counter behaviour.")
+		rospy.loginfo("Initialising counter behaviour.")
 
-        # counter
-        self.i = 0
-        self.n = n
-        super(counter, self).__init__(name)
+		# counter
+		self.i = 0
+		self.n = n
+		super(counter, self).__init__(name)
 
 
-    def update(self):
+	def update(self):
 
-        # increment i
-        self.i += 1
+		# increment i
+		self.i += 1
 
-        # succeed after count is done
-        return pt.common.Status.FAILURE if self.i <= self.n else pt.common.Status.SUCCESS
+		# succeed after count is done
+		return pt.common.Status.FAILURE if self.i <= self.n else pt.common.Status.SUCCESS
 
 
 class go(pt.behaviour.Behaviour):
 
-    """
-    Returns running and commands a velocity indefinitely.
-    """
+	"""
+	Returns running and commands a velocity indefinitely.
+	"""
 
-    def __init__(self, name, linear, angular):
+	def __init__(self, name, linear, angular):
 
-        rospy.loginfo("Initialising go behaviour.")
+		rospy.loginfo("Initialising go behaviour.")
 
-        # action space
-        #self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
-        self.cmd_vel_top = "/key_vel"
-        #rospy.loginfo(self.cmd_vel_top)
-        self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+		# action space
+		#self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
+		self.cmd_vel_top = "/key_vel"
+		#rospy.loginfo(self.cmd_vel_top)
+		self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
 
-        # command
-        self.move_msg = Twist()
-        self.move_msg.linear.x = linear
-        self.move_msg.angular.z = angular
+		# command
+		self.move_msg = Twist()
+		self.move_msg.linear.x = linear
+		self.move_msg.angular.z = angular
 
 
-        # become a behaviour
-        super(go, self).__init__(name)
+		# become a behaviour
+		super(go, self).__init__(name)
 
-    def update(self):
+	def update(self):
 
-        # send the message
-        rate = rospy.Rate(10)
-        self.cmd_vel_pub.publish(self.move_msg)
-        rate.sleep()
+		# send the message
+		rate = rospy.Rate(10)
+		self.cmd_vel_pub.publish(self.move_msg)
+		rate.sleep()
 
-        # tell the tree that you're running
-        return pt.common.Status.RUNNING
+		# tell the tree that you're running
+		return pt.common.Status.RUNNING
 
 
 class tuckarm(pt.behaviour.Behaviour):
 
-    """
-    Sends a goal to the tuck arm action server.
-    Returns running whilst awaiting the result,
-    success if the action was succesful, and v.v..
-    """
+	"""
+	Sends a goal to the tuck arm action server.
+	Returns running whilst awaiting the result,
+	success if the action was succesful, and v.v..
+	"""
 
-    def __init__(self):
+	def __init__(self):
 
-        rospy.loginfo("Initialising tuck arm behaviour.")
+		rospy.loginfo("Initialising tuck arm behaviour.")
 
-        # Set up action client
-        self.play_motion_ac = SimpleActionClient("/play_motion", PlayMotionAction)
+		# Set up action client
+		self.play_motion_ac = SimpleActionClient("/play_motion", PlayMotionAction)
 
-        # personal goal setting
-        self.goal = PlayMotionGoal()
-        self.goal.motion_name = 'home'
-        self.goal.skip_planning = True
+		# personal goal setting
+		self.goal = PlayMotionGoal()
+		self.goal.motion_name = 'home'
+		self.goal.skip_planning = True
 
-        # execution checker
-        self.sent_goal = False
-        self.finished = False
+		# execution checker
+		self.sent_goal = False
+		self.finished = False
 
-        # become a behaviour
-        super(tuckarm, self).__init__("Tuck arm!")
+		# become a behaviour
+		super(tuckarm, self).__init__("Tuck arm!")
 
-    def update(self):
+	def update(self):
+		global reset
+		global reset_completed
 
-        # already tucked the arm
-        if self.finished: 
-            return pt.common.Status.SUCCESS
-        
-        # command to tuck arm if haven't already
-        elif not self.sent_goal:
+		if reset and not reset_completed[0]:
+			self.finished = False
+			self.sent_goal = False
+			reset_completed[0] = True
+		# already tucked the arm		global reset
+		global reset_completed
+		if self.finished: 
+			return pt.common.Status.SUCCESS
 
-            # send the goal
-            self.play_motion_ac.send_goal(self.goal)
-            self.sent_goal = True
+		elif not self.sent_goal:
+			# send the goal
+			self.play_motion_ac.send_goal(self.goal)
+			self.sent_goal = True
 
-            # tell the tree you're running
-            return pt.common.Status.RUNNING
+			# tell the tree you're running
+			return pt.common.Status.RUNNING
 
-        # if I was succesful! :)))))))))
-        elif self.play_motion_ac.get_result():
+		# if I was succesful! :)))))))))
+		elif self.play_motion_ac.get_result():
 
-            # than I'm finished!
-            self.finished = True
-            return pt.common.Status.SUCCESS
+			# than I'm finished!
+			self.finished = True
+			return pt.common.Status.SUCCESS
 
-        # if failed
-        elif not self.play_motion_ac.get_result():
-            return pt.common.Status.FAILURE
+		# if failed
+		elif not self.play_motion_ac.get_result():
+			return pt.common.Status.FAILURE
 
-        # if I'm still trying :|
-        else:
-            return pt.common.Status.RUNNING
+		# if I'm still trying :|
+		else:
+			return pt.common.Status.RUNNING
 
 
 class movehead(pt.behaviour.Behaviour):
 
-    """
-    Lowers or raisesthe head of the robot.
-    Returns running whilst awaiting the result,
-    success if the action was succesful, and v.v..
-    """
+	"""
+	Lowers or raisesthe head of the robot.
+	Returns running whilst awaiting the result,
+	success if the action was succesful, and v.v..
+	"""
 
-    def __init__(self, direction):
+	def __init__(self, direction):
 
-        rospy.loginfo("Initialising move head behaviour.")
+		rospy.loginfo("Initialising move head behaviour.")
 
-        # server
-        mv_head_srv_nm = rospy.get_param(rospy.get_name() + '/move_head_srv')
-        self.move_head_srv = rospy.ServiceProxy(mv_head_srv_nm, MoveHead)
-        rospy.wait_for_service(mv_head_srv_nm, timeout=30)
+		# server
+		mv_head_srv_nm = rospy.get_param(rospy.get_name() + '/move_head_srv')
+		self.move_head_srv = rospy.ServiceProxy(mv_head_srv_nm, MoveHead)
+		rospy.wait_for_service(mv_head_srv_nm, timeout=30)
 
-        # head movement direction; "down" or "up"
-        self.direction = direction
+		# head movement direction; "down" or "up"
+		self.direction = direction
 
-        # execution checker
-        self.tried = False
-        self.done = False
+		# execution checker
+		self.tried = False
+		self.done = False
 
-        # become a behaviour
-        super(movehead, self).__init__("Lower head!")
+		# become a behaviour
+		super(movehead, self).__init__("Lower head!")
 
-    def update(self):
+	def update(self):
+		global reset
+		global reset_completed
 
-        # success if done
-        if self.done:
-            return pt.common.Status.SUCCESS
+		if reset and not reset_completed[1]:
+			self.done = False
+			self.tried = False
+			reset_completed[1] = True
 
-        # try if not tried
-        elif not self.tried:
+		# success if done
+		if self.done:
+			return pt.common.Status.SUCCESS
 
-            # command
-            self.move_head_req = self.move_head_srv(self.direction)
-            self.tried = True
+		# try if not tried
+		elif not self.tried:
 
-            # tell the tree you're running
-            return pt.common.Status.RUNNING
+			# command
+			self.move_head_req = self.move_head_srv(self.direction)
+			self.tried = True
 
-        # if succesful
-        elif self.move_head_req.success:
-            self.done = True
-            return pt.common.Status.SUCCESS
+			# tell the tree you're running
+			return pt.common.Status.RUNNING
 
-        # if failed
-        elif not self.move_head_req.success:
-            return pt.common.Status.FAILURE
+		# if succesful
+		elif self.move_head_req.success:
+			self.done = True
+			return pt.common.Status.SUCCESS
 
-        # if still trying
-        else:
-            return pt.common.Status.RUNNING
+		# if failed
+		elif not self.move_head_req.success:
+			return pt.common.Status.FAILURE
+
+		# if still trying
+		else:
+			return pt.common.Status.RUNNING
 
 if __name__ == "__main__":
 
