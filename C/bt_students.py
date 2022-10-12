@@ -15,15 +15,16 @@ repeat_detection = True
 wait_for_completion = False
 cube_picked_up = False
 cube_placed = False
+cube_detected = False
 reset = True
-reset_completed = [False for _ in range(8)]
+reset_completed = [False for _ in range(7)]
 
 def reset():
 	global reset
 	global reset_completed
 
 	reset = True
-	reset_completed = [False for _ in range(6)]
+	reset_completed = [False for _ in range(7)]
 
 class BehaviourTree(ptr.trees.BehaviourTree):
 
@@ -46,25 +47,27 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		b4 = pickup_cube("cube pick up")
 
 		# turn around
-		b5 = pt.composites.Selector(
-			name="Turn 180 degrees",
-			children=[counter(28, "Turned around?"), go("Turn around!", 0, -1)]
-		)
+		# b5 = pt.composites.Selector(
+		# 	name="Turn 180 degrees",
+		# 	children=[counter(28, "Turned around?"), go("Turn around!", 0, -1)]
+		# )
+
+		b5 = move_to_other_tabe("move to the other table")
 
 		# move forward
-		b6 = pt.composites.Selector(
-			name="Go to table",
-			children=[counter(8, "At other table?"), go("Go to the other table!", 1, 0)]
-		)
+		# b6 = pt.composites.Selector(
+		# 	name="Go to table",
+		# 	children=[counter(10, "At other table?"), go("Go to the other table!", 1, 0)]
+		# )
 
 		# place the cube
-		b7 = place_cube("cube placement")
+		b6 = place_cube("cube placement")
 
 		# detect the cube
-		b8 = check_cube_placed("check cube placement", aruco_pose_topic)
+		b7 = check_cube_placed("check cube placement", aruco_pose_topic)
 
 		# become the tree
-		tree = RSequence(name="Main sequence", children=[b1, b2, b3, b4, b5, b6, b7, b8])
+		tree = RSequence(name="Main sequence", children=[b1, b2, b3, b4, b5, b6, b7])
 		super(BehaviourTree, self).__init__(tree)
 
 		# execute the behaviour treensm___(name)
@@ -108,6 +111,63 @@ class pickup_cube(pt.behaviour.Behaviour):
 			rospy.loginfo("Picking up the cube failed!")
 			return pt.common.Status.FAILURE
 
+class move_to_other_tabe(pt.behaviour.Behaviour):
+
+	"""
+	move to the other table
+	"""
+
+	def __init__(self, name):
+		self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
+		self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+		self.moved = False
+
+		super(move_to_other_tabe, self).__init__("Moving to the other table.")
+
+	def update(self):
+		global cube_placed
+		global cube_detected
+
+
+		if reset and not reset_completed[4]:
+			self.moved = False
+			reset_completed[4] = True
+
+		if cube_placed and cube_detected:
+			rospy.loginfo("Task finished, cube is placed.")
+			return pt.common.Status.SUCCESS
+
+		if self.moved:
+			rospy.loginfo("Robot has moved!")
+			return pt.common.Status.SUCCESS
+
+		rospy.sleep(3)
+		move_msg = Twist()
+		move_msg.angular.z = -1
+
+		rate = rospy.Rate(10)
+		cnt = 0
+		while not rospy.is_shutdown() and cnt < 30:
+			self.cmd_vel_pub.publish(move_msg)
+			rate.sleep()
+			cnt = cnt + 1
+
+		rospy.sleep(3)
+
+		move_msg.linear.x = 1
+		move_msg.angular.z = 0
+		cnt = 0
+		while not rospy.is_shutdown() and cnt < 10:
+			self.cmd_vel_pub.publish(move_msg)
+			rate.sleep()
+			cnt = cnt + 1
+
+		self.cmd_vel_pub.publish(Twist())
+		self.state = 3
+		rospy.sleep(5)
+
+		self.moved = True
+		return pt.common.Status.SUCCESS
 
 class place_cube(pt.behaviour.Behaviour):
 
@@ -129,9 +189,9 @@ class place_cube(pt.behaviour.Behaviour):
 
 		rospy.sleep(3)
 
-		if reset and not reset_completed[4]:
+		if reset and not reset_completed[5]:
 			cube_placed = False
-			reset_completed[4] = True
+			reset_completed[5] = True
 
 		if cube_placed:
 			return pt.common.Status.SUCCESS
@@ -159,6 +219,8 @@ class check_cube_placed(pt.behaviour.Behaviour):
 		self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
 		self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
 		self.detected = False
+		self.play_motion_ac = SimpleActionClient("/play_motion", PlayMotionAction)
+
 
 		super(check_cube_placed, self).__init__("Detecting the cube.")
 
@@ -168,10 +230,13 @@ class check_cube_placed(pt.behaviour.Behaviour):
 		global repeat_detection
 		global reset
 		global reset_completed
+		global cube_detected
 
-		if reset and not reset_completed[5]:
+		if reset and not reset_completed[6]:
 			self.detected = False
-			reset_completed[5] = True
+			reset_completed[6] = True
+
+		cube_detected = self.detected
 
 		if self.detected:
 			reset = False
@@ -187,17 +252,36 @@ class check_cube_placed(pt.behaviour.Behaviour):
 
 			rospy.loginfo("Moving towards another desk")
 
+			# tuck arm
+			
+			rospy.loginfo(" Tucking the arm...")
+			goal = PlayMotionGoal()
+			goal.motion_name = 'home'
+			goal.skip_planning = True
+			self.play_motion_ac.send_goal(goal)
+			success_tucking = self.play_motion_ac.wait_for_result(rospy.Duration(100.0))
+
+			if success_tucking:
+				self.state = 1
+			else:
+				self.play_motion_ac.cancel_goal()
+				rospy.logerr("play_motion failed to tuck arm, reset simulation")
+				self.state = -1
+
+			rospy.sleep(1)
+
+			# moving 
 			move_msg = Twist()
 			move_msg.angular.z = -1
 
 			rate = rospy.Rate(10)
 			cnt = 0
-			while not rospy.is_shutdown() and cnt < 28:
+			while not rospy.is_shutdown() and cnt < 30:
 				self.cmd_vel_pub.publish(move_msg)
 				rate.sleep()
 				cnt = cnt + 1
 
-			rospy.sleep(1)
+			rospy.sleep(5)
 
 			move_msg.linear.x = 1
 			move_msg.angular.z = 0
@@ -211,11 +295,13 @@ class check_cube_placed(pt.behaviour.Behaviour):
 			self.state = 3
 			rospy.sleep(1)
 			reset = True
-			reset_completed = [False for _ in range(6)]
+			reset_completed = [False for _ in range(7)]
 			return pt.common.Status.SUCCESS
 		else:
 			rospy.loginfo("Cube detected!")
 			self.detected = True
+			cube_detected = self.detected
+
 			return pt.common.Status.SUCCESS
 
 class detect_cube(pt.behaviour.Behaviour):
