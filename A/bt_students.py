@@ -8,7 +8,7 @@ from std_srvs.srv import SetBool
 from actionlib import SimpleActionClient
 from play_motion_msgs.msg import PlayMotionAction, PlayMotionGoal
 from robotics_project.srv import MoveHead
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 cube_pose = None
 repeat_detection = True
@@ -18,6 +18,7 @@ cube_placed = False
 cube_detected = False
 reset = True
 reset_completed = [False for _ in range(8)]
+head_pose = "down"
 
 def reset():
 	global reset
@@ -45,7 +46,7 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		b3 = navigate("navigation", kind="pickup")
 
 		# detect the cube
-		b4 = detect_cube("cube detection", aruco_pose_topic)
+		b4 = detect_cube("cube detection", self.aruco_pose_topic)
 
 		# pick up the cube
 		b5 = pickup_cube("cube pick up")
@@ -57,7 +58,7 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		b7 = navigate("navigation", kind="place")
 
 		# detect the cube
-		b8 = check_cube_placed("check cube placement", aruco_pose_topic)
+		b8 = check_cube_placed("check cube placement", self.aruco_pose_topic)
 
 		# become the tree
 		tree = RSequence(name="Main sequence", children=[b1, b2, b3, b4, b5, b6, b7, b8])
@@ -67,6 +68,11 @@ class BehaviourTree(ptr.trees.BehaviourTree):
 		while not rospy.is_shutdown(): self.tick_tock(1)
 
 
+def p_converged(p_cloud, tolerance):
+    # checks if the particle cloud converged
+	max_element = max(p_cloud.pose.covariance)
+	return abs(max_element) < tolerance
+
 class localize(pt.behaviour.Behaviour):
 
 	"""
@@ -74,11 +80,56 @@ class localize(pt.behaviour.Behaviour):
 	"""
 
 	def __init__(self, name):
+     
+		self.localized = False
+		self.mv_head_srv_nm = rospy.get_param(rospy.get_name() + '/move_head_srv')
+		self.move_head_srv = rospy.ServiceProxy(self.mv_head_srv_nm, MoveHead)
+		self.cmd_vel_top = rospy.get_param(rospy.get_name() + '/cmd_vel_topic')
+		self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+  
+		rospy.wait_for_service(self.mv_head_srv_nm, timeout=30)
+
 		
 		super(localize, self).__init__("Localization started")
 
 	def update(self):
-		pass
+		global reset
+		global reset_completed
+		global head_pose
+     
+		if self.localized:
+			return pt.common.Status.SUCCESS
+
+		if reset and not reset_completed[1]:
+			self.localized = False
+			reset_completed[1] = True
+   
+		if head_pose == "down":
+			self.move_head_srv("up")
+			rospy.sleep(3)
+			head_pose = "up"
+   
+		# spin to look around
+		rate = rospy.Rate(10)
+		move_msg = Twist()
+		move_msg.angular.z = -1 
+  
+		cnt = 0
+		while not rospy.is_shutdown() and cnt < 60:
+			self.cmd_vel_pub.publish(move_msg)
+			rate.sleep()
+			cnt += 1
+
+		rospy.sleep(5)
+  
+		# spinning complete, check particle cloud
+		p_cloud = rospy.wait_for_message("/amcl_pose", PoseWithCovarianceStamped, 5)
+		if p_converged(p_cloud, tolerance=0.045):
+			self.localized = True
+			return pt.common.Status.SUCCESS
+		else:
+			rospy.logerr("Particle cloud did not converge, try changing the tolerance if it won't work again.")
+			return pt.common.Status.FAILURE
 
 
 class navigate(pt.behaviour.Behaviour):
@@ -460,6 +511,7 @@ class movehead(pt.behaviour.Behaviour):
 		# server
 		mv_head_srv_nm = rospy.get_param(rospy.get_name() + '/move_head_srv')
 		self.move_head_srv = rospy.ServiceProxy(mv_head_srv_nm, MoveHead)
+
 		rospy.wait_for_service(mv_head_srv_nm, timeout=30)
 
 		# head movement direction; "down" or "up"
